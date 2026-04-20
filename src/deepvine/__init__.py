@@ -2,6 +2,7 @@
 
 from .data_loading import create_dataloader
 from .datasets import VineLeafDataset, build_eval_transforms, build_train_transforms
+from .engine import FocalLabelSmoothingLoss, evaluate, fit, resolve_device
 from .models import VineLeafClassifier
 
 __all__ = [
@@ -9,5 +10,9 @@ __all__ = [
     "build_train_transforms",
     "build_eval_transforms",
     "create_dataloader",
+    "FocalLabelSmoothingLoss",
+    "evaluate",
+    "fit",
+    "resolve_device",
     "VineLeafClassifier",
 ]

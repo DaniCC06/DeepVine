@@ -7,7 +7,7 @@ import sys
 import torch
 from torch import Tensor
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -56,9 +56,9 @@ class TrainingConfig:
 
 def _build_train_val_loaders(config: TrainingConfig) -> tuple[DataLoader[tuple[Tensor, Tensor]], DataLoader[tuple[Tensor, Tensor]], dict[str, int]]:
     """Create train and validation loaders from dataset directory."""
-    full_dataset = VineLeafDataset(root_dir=config.dataset_dir, transform=None)
+    base_dataset = VineLeafDataset(root_dir=config.dataset_dir, transform=None)
 
-    num_samples = len(full_dataset)
+    num_samples = len(base_dataset)
     num_val = int(num_samples * config.val_split)
     num_train = num_samples - num_val
     if num_train <= 0 or num_val <= 0:
@@ -66,10 +66,21 @@ def _build_train_val_loaders(config: TrainingConfig) -> tuple[DataLoader[tuple[T
         raise ValueError(msg)
 
     generator = torch.Generator().manual_seed(42)
-    train_subset, val_subset = random_split(full_dataset, [num_train, num_val], generator=generator)
+    shuffled_indices = torch.randperm(num_samples, generator=generator).tolist()
+    train_indices = shuffled_indices[:num_train]
+    val_indices = shuffled_indices[num_train:]
 
-    train_subset.dataset.transform = build_train_transforms(image_size=config.image_size)
-    val_subset.dataset.transform = build_eval_transforms(image_size=config.image_size)
+    train_dataset = VineLeafDataset(
+        root_dir=config.dataset_dir,
+        transform=build_train_transforms(image_size=config.image_size),
+    )
+    val_dataset = VineLeafDataset(
+        root_dir=config.dataset_dir,
+        transform=build_eval_transforms(image_size=config.image_size),
+    )
+
+    train_subset = Subset(train_dataset, train_indices)
+    val_subset = Subset(val_dataset, val_indices)
 
     pin_memory = torch.cuda.is_available()
 
@@ -90,7 +101,7 @@ def _build_train_val_loaders(config: TrainingConfig) -> tuple[DataLoader[tuple[T
         persistent_workers=config.num_workers > 0,
     )
 
-    return train_loader, val_loader, full_dataset.class_to_idx
+    return train_loader, val_loader, base_dataset.class_to_idx
 
 
 def run_training(config: TrainingConfig) -> TrainingHistory:
