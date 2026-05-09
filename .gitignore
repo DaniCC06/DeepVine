@@ -20,6 +20,8 @@ checkpoints/
 *.pth
 *.onnx
 *.torchscript
+!checkpoints/
+!checkpoints/best_model.pt
 
 # Reports & generated outputs
 reports/
