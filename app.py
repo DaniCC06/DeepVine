@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import io
+import logging
 from pathlib import Path
 import sys
 from typing import Any
@@ -13,6 +15,13 @@ from PIL import Image
 import torch
 import torch.nn as nn
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -21,6 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 from deepvine.datasets import build_eval_transforms
 from deepvine.engine import resolve_device
 from deepvine.models import BackboneName, VineLeafClassifier
+from deepvine.pipeline import ObjectDetectionClassificationPipeline
 from interpretability import GradCAM, get_target_layer, overlay_heatmap_on_image
 
 UNCERTAIN_LABEL = "Variedad Incierta/Requiere Experto"
@@ -32,16 +42,20 @@ class InferenceConfig:
 
     Args:
         checkpoint_path: Trained best model checkpoint.
+        detector_path: Trained YOLO model checkpoint.
         backbone: Backbone used during training.
         image_size: Deterministic inference image size.
         confidence_threshold: Scientific uncertainty threshold.
+        detector_conf: YOLO confidence threshold.
         device: Optional explicit runtime device.
     """
 
     checkpoint_path: str = "./checkpoints/best_model.pt"
+    detector_path: str = "./checkpoints/yolo_leaf_detector.pt"
     backbone: BackboneName = "resnet50"
     image_size: int = 224
     confidence_threshold: float = 0.70
+    detector_conf: float = 0.40
     device: str | None = None
 
 
@@ -50,9 +64,10 @@ class PredictionResponse(BaseModel):
 
     predicted_class: str = Field(..., description="Final class after uncertainty thresholding.")
     raw_predicted_class: str = Field(..., description="Top-1 class predicted by the model.")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Top-1 softmax confidence.")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Top-1 softmax confidence (aggregated).")
     is_uncertain: bool = Field(..., description="True when confidence is below threshold.")
     threshold: float = Field(..., ge=0.0, le=1.0)
+    leaves_detected: int = Field(default=0, description="Number of leaves detected and processed.")
     gradcam_overlay_base64: str | None = Field(default=None)
 
 
@@ -69,6 +84,13 @@ class InferenceService:
             device=self.device,
         )
         self.idx_to_class = {idx: name for name, idx in self.class_to_idx.items()}
+        
+        # Initialize pipeline
+        self.pipeline = ObjectDetectionClassificationPipeline(
+            yolo_model_path=config.detector_path,
+            classifier_service=self,
+            yolo_conf=config.detector_conf
+        )
 
     @staticmethod
     def _load_model_and_mapping(
@@ -77,7 +99,9 @@ class InferenceService:
         device: torch.device,
     ) -> tuple[VineLeafClassifier, dict[str, int]]:
         """Load model and class mapping from checkpoint."""
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        # weights_only=False is required because checkpoints include Python dicts
+        # (class_to_idx, metrics). Only load checkpoints from trusted sources.
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         class_to_idx = ckpt.get("class_to_idx")
         if not isinstance(class_to_idx, dict) or not class_to_idx:
             msg = "Checkpoint does not contain a valid class_to_idx mapping."
@@ -112,21 +136,19 @@ class InferenceService:
 
     def predict(self, image: Image.Image, include_gradcam: bool) -> PredictionResponse:
         """Predict class, apply uncertainty threshold and optionally Grad-CAM."""
-        input_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            logits = self.model(input_tensor)
-            probs = torch.softmax(logits, dim=1)
-            confidence, pred_idx_tensor = torch.max(probs, dim=1)
-
-        pred_idx = int(pred_idx_tensor.item())
-        conf = float(confidence.item())
-        raw_label = self.idx_to_class[pred_idx]
+        pipeline_result = self.pipeline.predict(image)
+        
+        pred_idx = pipeline_result["predicted_idx"]
+        conf = pipeline_result["confidence"]
+        raw_label = pipeline_result["raw_predicted_class"]
+        leaves_detected = pipeline_result["leaves_detected"]
+        
         is_uncertain = conf < self.config.confidence_threshold
         final_label = UNCERTAIN_LABEL if is_uncertain else raw_label
 
         gradcam_b64: str | None = None
         if include_gradcam:
+            # Gradcam solo se hace sobre la imagen original por compatibilidad actual
             gradcam_b64 = self._gradcam_overlay_base64(image=image, class_idx=pred_idx)
 
         return PredictionResponse(
@@ -135,25 +157,33 @@ class InferenceService:
             confidence=conf,
             is_uncertain=is_uncertain,
             threshold=self.config.confidence_threshold,
+            leaves_detected=leaves_detected,
             gradcam_overlay_base64=gradcam_b64,
         )
+
+
+service: InferenceService | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
+    """Load model on startup and release resources on shutdown."""
+    global service
+    logger.info("Loading DeepVine inference model...")
+    config = InferenceConfig()
+    service = InferenceService(config=config)
+    logger.info("Model loaded. Service ready.")
+    yield
+    logger.info("Shutting down DeepVine service.")
+    service = None
 
 
 app = FastAPI(
     title="DeepVine Inference API",
     description="Production-ready backend for grapevine leaf variety classification.",
     version="1.0.0",
+    lifespan=lifespan,
 )
-
-service: InferenceService | None = None
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    """Load model at service startup for low-latency inference."""
-    global service
-    config = InferenceConfig()
-    service = InferenceService(config=config)
 
 
 @app.get("/health")

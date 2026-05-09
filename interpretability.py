@@ -189,7 +189,7 @@ def generate_gradcam_artifacts(
         cam = gradcam.generate(input_tensor=input_tensor, class_idx=class_idx)
         cam_cpu = cam.detach().cpu()
 
-        resized_original = original.resize((image_size, image_size), resample=Image.BILINEAR)
+        resized_original = original.resize((image_size, image_size), resample=Image.Resampling.BILINEAR)
         overlay = overlay_heatmap_on_image(image=resized_original, heatmap=cam_cpu)
 
         heatmap_img = Image.fromarray((cam_cpu.numpy() * 255.0).astype(np.uint8), mode="L")

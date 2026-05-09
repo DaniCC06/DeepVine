@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 import sys
 from typing import Any
@@ -13,6 +14,13 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -57,7 +65,8 @@ def _load_model_from_checkpoint(
     device: torch.device,
 ) -> tuple[VineLeafClassifier, dict[str, int]]:
     """Load model and class mapping from a training checkpoint."""
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False required: checkpoint contains Python dicts (class_to_idx, metrics).
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     class_to_idx = ckpt.get("class_to_idx")
     if not isinstance(class_to_idx, dict) or not class_to_idx:
         msg = "Checkpoint does not contain a valid class_to_idx mapping."
@@ -212,12 +221,14 @@ def run_holdout_evaluation(config: EvaluationConfig) -> dict[str, Any]:
         Dictionary with computed metrics and generated artifact paths.
     """
     device = resolve_device(config.device)
+    logger.info("Loading checkpoint from %s", config.checkpoint_path)
     model, class_to_idx_ckpt = _load_model_from_checkpoint(
         checkpoint_path=config.checkpoint_path,
         backbone=config.backbone,
         device=device,
     )
 
+    logger.info("Building test loader from %s", config.test_dir)
     test_loader, class_to_idx_test = _build_test_loader(config)
     if class_to_idx_test != class_to_idx_ckpt:
         msg = "Class mapping mismatch between checkpoint and hold-out test directory."
@@ -282,6 +293,14 @@ def run_holdout_evaluation(config: EvaluationConfig) -> dict[str, Any]:
 
     report_json.write_text(json.dumps(report, indent=2, ensure_ascii=True), encoding="utf-8")
     report_md.write_text(_build_markdown_report(report), encoding="utf-8")
+
+    logger.info(
+        "Evaluation complete. Accuracy=%.4f | Macro F1=%.4f | Weighted F1=%.4f",
+        metrics.accuracy,
+        metrics.macro_f1,
+        metrics.weighted_f1,
+    )
+    logger.info("Reports saved to %s", output_dir)
 
     return report
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -8,6 +9,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+
+logger = logging.getLogger(__name__)
 
 IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
@@ -117,7 +120,9 @@ class VineLeafDataset(Dataset[tuple[Tensor, int]]):
             msg = f"No images found in dataset directory: {self.root_dir}"
             raise ValueError(msg)
 
-        self.transform: Callable[[Image.Image], Tensor] = transform or build_train_transforms()
+        # Default to eval transforms (deterministic). Train transforms must be
+        # passed explicitly to avoid accidental augmentation during validation.
+        self.transform: Callable[[Image.Image], Tensor] = transform or build_eval_transforms()
 
     def __len__(self) -> int:
         """Return number of samples available in the dataset."""
@@ -132,8 +137,26 @@ class VineLeafDataset(Dataset[tuple[Tensor, int]]):
         Returns:
             A tuple containing image tensor and integer class label.
         """
-        image_path, label = self.samples[index]
-        with Image.open(image_path) as image:
-            image_rgb = image.convert("RGB")
-        tensor = self.transform(image_rgb)
-        return tensor, label
+        # Attempt to load the requested sample. If it fails (missing/corrupt),
+        # retry with different random samples up to a small limit to avoid
+        # crashing the DataLoader worker. This is tolerant to transient
+        # filesystem inconsistencies (OneDrive, interrupted copies, etc.).
+        num_attempts = 5
+        cur_idx = index
+        last_exc: Exception | None = None
+        for attempt in range(num_attempts):
+            image_path, label = self.samples[cur_idx]
+            try:
+                with Image.open(image_path) as image:
+                    image_rgb = image.convert("RGB")
+                tensor = self.transform(image_rgb)
+                return tensor, label
+            except (OSError, SyntaxError, FileNotFoundError) as exc:
+                logger.error("Corrupt or unreadable image at %s: %s", image_path, exc)
+                last_exc = exc
+                # pick a different index for the next attempt
+                # deterministic fallback: next index modulo length
+                cur_idx = (cur_idx + 1) % len(self.samples)
+
+        # If all attempts fail, raise to surface the underlying issue.
+        raise RuntimeError(f"Failed to load image after {num_attempts} attempts: {self.samples[index][0]}") from last_exc

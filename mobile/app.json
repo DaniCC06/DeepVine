@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "DeepVine",
+    "slug": "deepvine",
+    "version": "1.0.0",
+    "sdkVersion": "54.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0C0610",
+    "splash": {
+      "backgroundColor": "#0C0610",
+      "resizeMode": "contain"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0C0610"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE"
+      ]
+    },
+    "ios": {
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "DeepVine usa la cámara para fotografiar hojas de vid e identificar la variedad mediante IA.",
+        "NSPhotoLibraryUsageDescription": "DeepVine accede a la galería para seleccionar fotografías de hojas de vid."
+      }
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "DeepVine necesita la cámara para fotografiar hojas de vid.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ]
+    ]
+  }
+}

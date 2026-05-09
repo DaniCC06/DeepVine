@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -8,11 +9,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -190,7 +192,8 @@ def train_one_epoch(
     optimizer: Optimizer,
     scheduler: OneCycleLR,
     device: torch.device,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
+    max_grad_norm: float = 1.0,
 ) -> TrainEpochMetrics:
     """Train model for one epoch using automatic mixed precision.
 
@@ -202,6 +205,7 @@ def train_one_epoch(
         scheduler: OneCycleLR scheduler stepped per batch.
         device: Target torch device.
         scaler: Gradient scaler for AMP.
+        max_grad_norm: Maximum gradient norm for clipping. Set to 0 to disable.
 
     Returns:
         Aggregated loss and accuracy for the epoch.
@@ -220,11 +224,14 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
             loss = criterion(logits, targets)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        if max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -347,8 +354,11 @@ def fit(
     device: torch.device,
     checkpoint_path: str | Path,
     class_to_idx: dict[str, int],
+    resume_from_checkpoint: bool = False,
+    patience: int = 5,
+    max_grad_norm: float = 1.0,
 ) -> TrainingHistory:
-    """Run full training process with AMP, OneCycleLR and checkpointing.
+    """Run full training process with AMP, OneCycleLR, Early Stopping and checkpointing.
 
     Args:
         model: Classification model.
@@ -357,11 +367,14 @@ def fit(
         optimizer: Optimizer instance.
         criterion: Loss function.
         num_classes: Number of classes.
-        epochs: Number of epochs.
+        epochs: Maximum number of epochs.
         max_lr: Maximum LR for OneCycle policy.
         device: Target torch device.
         checkpoint_path: Path where best model is stored.
         class_to_idx: Mapping from class name to index.
+        resume_from_checkpoint: If True, load model/optimizer from checkpoint_path.
+        patience: Early stopping patience (epochs without val F1 improvement).
+        max_grad_norm: Gradient clipping norm. Set to 0 to disable.
 
     Returns:
         Full training history and best-score metadata.
@@ -369,9 +382,12 @@ def fit(
     if epochs <= 0:
         msg = "epochs must be > 0."
         raise ValueError(msg)
+    if patience <= 0:
+        msg = "patience must be > 0."
+        raise ValueError(msg)
 
     model.to(device)
-    scaler = GradScaler(enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
 
     scheduler = OneCycleLR(
         optimizer=optimizer,
@@ -394,6 +410,81 @@ def fit(
         best_checkpoint_path=str(checkpoint_path),
     )
 
+    if resume_from_checkpoint:
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists():
+            msg = f"resume_from_checkpoint=True but checkpoint was not found: {ckpt_path}"
+            raise FileNotFoundError(msg)
+
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+        checkpoint_class_to_idx = checkpoint.get("class_to_idx")
+        if not isinstance(checkpoint_class_to_idx, dict):
+            msg = "Checkpoint does not contain a valid class_to_idx mapping."
+            raise ValueError(msg)
+
+        model_state = checkpoint.get("model_state_dict")
+        if not isinstance(model_state, dict):
+            msg = "Checkpoint does not contain a valid model_state_dict."
+            raise ValueError(msg)
+
+        class_mapping_matches = checkpoint_class_to_idx == class_to_idx
+        if class_mapping_matches:
+            model.load_state_dict(model_state, strict=True)
+
+            optimizer_state = checkpoint.get("optimizer_state_dict")
+            if isinstance(optimizer_state, dict):
+                optimizer.load_state_dict(optimizer_state)
+
+            best_macro_f1 = checkpoint.get("val_macro_f1")
+            if isinstance(best_macro_f1, (float, int)):
+                history.best_macro_f1 = float(best_macro_f1)
+        else:
+            # Fallback: load only parameters that are shape-compatible (e.g., backbone),
+            # then continue training with a fresh optimizer/scheduler and reset best metric.
+            current_state = model.state_dict()
+            compatible_state: dict[str, Tensor] = {}
+            skipped_keys: list[str] = []
+            for key, value in model_state.items():
+                current_value = current_state.get(key)
+                if current_value is None or current_value.shape != value.shape:
+                    skipped_keys.append(key)
+                    continue
+                compatible_state[key] = value
+
+            if not compatible_state:
+                msg = "Checkpoint is not compatible with current model architecture."
+                raise ValueError(msg)
+
+            model.load_state_dict(compatible_state, strict=False)
+            history.best_macro_f1 = float("-inf")
+
+            checkpoint_labels = sorted(str(k) for k in checkpoint_class_to_idx)
+            dataset_labels = sorted(str(k) for k in class_to_idx)
+            logger.warning(
+                "Checkpoint class_to_idx differs from current dataset. "
+                "Loaded %d/%d compatible parameters and skipped %d keys; "
+                "optimizer state was not restored.\n"
+                "Checkpoint labels: %s\nDataset labels: %s",
+                len(compatible_state),
+                len(model_state),
+                len(skipped_keys),
+                checkpoint_labels,
+                dataset_labels,
+            )
+
+        previous_epoch = checkpoint.get("epoch")
+        previous_epoch_num = int(previous_epoch) if isinstance(previous_epoch, int) else -1
+        logger.info(
+            "Resumed from checkpoint '%s' (saved at epoch %d, best val_macro_f1=%.4f).",
+            ckpt_path,
+            max(previous_epoch_num, 0),
+            history.best_macro_f1,
+        )
+        logger.info("OneCycleLR scheduler starts a new cycle for this resumed run.")
+
+    patience_counter = 0
+
     for epoch in range(1, epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
@@ -403,6 +494,7 @@ def fit(
             scheduler=scheduler,
             device=device,
             scaler=scaler,
+            max_grad_norm=max_grad_norm,
         )
         val_metrics = evaluate(
             model=model,
@@ -418,8 +510,21 @@ def fit(
         history.val_accuracy.append(val_metrics.accuracy)
         history.val_macro_f1.append(val_metrics.macro_f1)
 
+        logger.info(
+            "Epoch %03d/%03d | train_loss=%.4f train_acc=%.4f | "
+            "val_loss=%.4f val_acc=%.4f val_macro_f1=%.4f",
+            epoch,
+            epochs,
+            train_metrics.loss,
+            train_metrics.accuracy,
+            val_metrics.loss,
+            val_metrics.accuracy,
+            val_metrics.macro_f1,
+        )
+
         if val_metrics.macro_f1 > history.best_macro_f1:
             history.best_macro_f1 = val_metrics.macro_f1
+            patience_counter = 0
             save_best_checkpoint(
                 checkpoint_path=checkpoint_path,
                 model=model,
@@ -429,12 +534,22 @@ def fit(
                 metrics=val_metrics,
                 class_to_idx=class_to_idx,
             )
-
-        print(
-            f"Epoch {epoch:03d}/{epochs:03d} | "
-            f"train_loss={train_metrics.loss:.4f} train_acc={train_metrics.accuracy:.4f} | "
-            f"val_loss={val_metrics.loss:.4f} val_acc={val_metrics.accuracy:.4f} "
-            f"val_macro_f1={val_metrics.macro_f1:.4f}"
-        )
+            logger.info("  -> New best val_macro_f1=%.4f. Checkpoint saved.", val_metrics.macro_f1)
+        else:
+            patience_counter += 1
+            logger.info(
+                "  -> No improvement (%d/%d). Best so far: %.4f.",
+                patience_counter,
+                patience,
+                history.best_macro_f1,
+            )
+            if patience_counter >= patience:
+                logger.info(
+                    "Early stopping triggered at epoch %d/%d (no improvement for %d epochs).",
+                    epoch,
+                    epochs,
+                    patience,
+                )
+                break
 
     return history
